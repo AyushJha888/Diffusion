@@ -3,3 +3,4 @@ numpy
 pillow
 imageio
 opencv-python
+matplotlib

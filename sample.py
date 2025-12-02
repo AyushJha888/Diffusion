@@ -56,7 +56,7 @@ def main() -> None:
         beta_start=float(diff_cfg["beta_start"]),
         beta_end=float(diff_cfg["beta_end"]),
     )
-
+    diffusion.to(device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

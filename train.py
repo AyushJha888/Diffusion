@@ -2,8 +2,11 @@ import argparse
 import os
 import random
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -33,10 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=0.02)
     parser.add_argument("--save-dir", type=str, default="checkpoints")
+    parser.add_argument("--loss-curve-path", type=str, default=None, help="Where to save a loss curve image.")
     parser.add_argument("--device", type=str, default=None, help="Override device selection (cpu/cuda).")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement). Default: 20. Set to 0 to disable.")
+    parser.add_argument("--min-delta", type=float, default=1e-4, help="Minimum change to qualify as an improvement.")
     return parser.parse_args()
 
 
@@ -58,6 +64,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     save_path: Path,
     step: int,
+    epoch: int,
     extra_config: Dict[str, Any],
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,9 +84,25 @@ def save_checkpoint(
             "num_channels": dataset.num_channels,
         },
         "step": step,
+        "epoch": epoch,
         "extra_config": extra_config,
     }
     torch.save(payload, save_path)
+
+
+def plot_loss_curve(loss_values: List[float], save_path: Path) -> None:
+    if not loss_values:
+        return
+    save_path = save_path if isinstance(save_path, Path) else Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 4))
+    plt.plot(loss_values)
+    plt.xlabel("Training step")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Curve")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
 
 
 def main() -> None:
@@ -99,13 +122,27 @@ def main() -> None:
 
     model = PositionalUNet1D(in_channels=dataset.num_channels)
     diffusion = GaussianDiffusion(model, timesteps=args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end)
-    model.to(device)
+    diffusion.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     global_step = 0
+    loss_history: List[float] = []
+    
+    # Early stopping setup (enabled by default)
+    best_loss = float('inf')
+    best_epoch = 0
+    patience_counter = 0
+    patience = args.patience if args.patience > 0 else float('inf')
+    min_delta = args.min_delta
+    recent_losses = []  # Track recent losses for plateau detection
+    window_size = min(5, max(3, patience // 2)) if patience < float('inf') else 0  # Look at last few epochs for stability
+    
+    if patience < float('inf'):
+        print(f"Early stopping enabled: will stop after {patience} epochs without improvement (min_delta={min_delta})")
 
     for epoch in range(args.epochs):
         model.train()
+        epoch_losses = []
         for batch in dataloader:
             # Ensure batch is shaped (B, C, T) before diffusion
             if batch.dim() == 2:
@@ -124,21 +161,81 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+            loss_value = loss.item()
+            epoch_losses.append(loss_value)
+            loss_history.append(loss_value)
             if global_step % args.log_interval == 0:
-                print(f"epoch {epoch} step {global_step} loss {loss.item():.4f}")
+                print(f"epoch {epoch} step {global_step} loss {loss_value:.4f}")
             global_step += 1
+        
+        # Calculate average loss for the epoch
+        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        print(f"epoch {epoch} completed - average loss: {avg_epoch_loss:.4f}")
+        
+        # Track recent losses for plateau detection (only if early stopping is enabled)
+        if patience < float('inf'):
+            recent_losses.append(avg_epoch_loss)
+            if len(recent_losses) > window_size:
+                recent_losses.pop(0)
+        
+        # Early stopping check
+        improved = avg_epoch_loss < best_loss - min_delta
+        if improved:
+            best_loss = avg_epoch_loss
+            best_epoch = epoch
+            patience_counter = 0
+            # Save best model checkpoint
+            ckpt_path = Path(args.save_dir) / "ddpm_best.pth"
+            save_checkpoint(
+                model=model,
+                diffusion=diffusion,
+                dataset=dataset,
+                optimizer=optimizer,
+                save_path=ckpt_path,
+                step=global_step,
+                epoch=epoch,
+                extra_config=vars(args),
+            )
+            print(f"saved best checkpoint (loss: {best_loss:.4f}) to {ckpt_path}")
+        else:
+            patience_counter += 1
+            
+            # Check for plateau: if recent losses are stable (low variance), stop earlier
+            plateau_detected = False
+            if patience < float('inf') and len(recent_losses) >= window_size and patience_counter >= window_size:
+                loss_variance = np.var(recent_losses)
+                loss_range = max(recent_losses) - min(recent_losses)
+                # If losses are very stable (low variance and small range), consider it a plateau
+                if loss_variance < min_delta * 2 and loss_range < min_delta * 3:
+                    plateau_detected = True
+                    print(f"  Plateau detected: loss has stabilized (variance={loss_variance:.6f}, range={loss_range:.6f})")
+            
+            if patience_counter >= patience or plateau_detected:
+                reason = "plateau detected" if plateau_detected else f"{patience} epochs without improvement"
+                print(f"\nEarly stopping triggered: {reason}.")
+                print(f"Best loss: {best_loss:.4f} at epoch {best_epoch}")
+                print(f"Stopping training at epoch {epoch + 1}")
+                break
+            elif patience < float('inf'):
+                print(f"  (no improvement for {patience_counter}/{patience} epochs, best: {best_loss:.4f})")
 
-        ckpt_path = Path(args.save_dir) / f"ddpm_epoch_{epoch+1}.pth"
-        save_checkpoint(
-            model=model,
-            diffusion=diffusion,
-            dataset=dataset,
-            optimizer=optimizer,
-            save_path=ckpt_path,
-            step=global_step,
-            extra_config=vars(args),
-        )
-        print(f"saved checkpoint to {ckpt_path}")
+        # Save checkpoint every 50 epochs or on the last epoch
+        if epoch % 50 == 0 or epoch == args.epochs - 1:
+            ckpt_path = Path(args.save_dir) / f"ddpm_epoch_{epoch+1}.pth"
+            save_checkpoint(
+                model=model,
+                diffusion=diffusion,
+                dataset=dataset,
+                optimizer=optimizer,
+                save_path=ckpt_path,
+                step=global_step,
+                epoch=epoch,
+                extra_config=vars(args),
+            )
+            print(f"saved checkpoint to {ckpt_path}")
+
+    if args.loss_curve_path:
+        plot_loss_curve(loss_history, Path(args.loss_curve_path))
 
 
 if __name__ == "__main__":
